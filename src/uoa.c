@@ -19,6 +19,12 @@
  * it refers TOA of LVS and ip_vs kernel module.
  *
  * raychen@qiyi.com, Feb 2018, initial.
+ *
+ *
+ * Copyright 2023 Huawei Cloud Computing Technology Co., Ltd.
+ *
+ * lizhang5@huawei.com, 2023/9,
+ * add support of parsing source ip/port from ipv6 destination extension option.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -49,7 +55,7 @@
 #include <linux/spinlock.h>
 #include <linux/timer.h>
 #include <linux/vmalloc.h>
-#include <asm/pgtable_types.h>
+
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3,3,0)
 #include <net/ipv6.h> /* ipv6_skip_exthdr */
@@ -674,8 +680,42 @@ static void uoa_map_exit(void)
  */
 static int uoa_send_ack(const struct sk_buff *oskb)
 {
-    /* TODO: */
     return 0;
+}
+
+static inline struct uoa_map *uoa_map_ele_new(__be16 af, unsigned char *optptr,
+                                                int optlen, void *iph,
+                                                __be16 sport, __be16 dport)
+{
+    struct uoa_map *um = NULL;
+    
+    UOA_STATS_INC(uoa_got);
+    um = kmem_cache_alloc(uoa_map_cache, GFP_ATOMIC);
+    if (unlikely(um == NULL)) {
+        UOA_STATS_INC(uoa_miss);
+        return NULL;
+    }
+
+    atomic_set(&um->refcnt, 0);
+    um->af = af;
+    if (AF_INET == af) {
+        memmove(&um->saddr.in, &((struct iphdr *)iph)->saddr,
+                    sizeof(struct in_addr));
+        memmove(&um->daddr.in, &((struct iphdr *)iph)->daddr,
+                    sizeof(struct in_addr));
+    } else {
+        /* ipv6 */
+        memmove(&um->saddr.in6, &((struct ipv6hdr *)iph)->saddr,
+                    sizeof(struct in6_addr));
+        memmove(&um->daddr.in6, &((struct ipv6hdr *)iph)->daddr,
+                    sizeof(struct in6_addr));
+    }
+    um->sport = sport;
+    um->dport = dport;
+    memcpy(&um->optuoa, optptr, optlen);
+
+    UOA_STATS_INC(uoa_saved);
+    return um;
 }
 
 static struct uoa_map *uoa_parse_ipopt(__be16 af, unsigned char *optptr,
@@ -703,33 +743,10 @@ static struct uoa_map *uoa_parse_ipopt(__be16 af, unsigned char *optptr,
             goto out; /* invalid */
 
         if (*optptr == IPOPT_UOA) {
-            UOA_STATS_INC(uoa_got);
-            um = kmem_cache_alloc(uoa_map_cache, GFP_ATOMIC);
-            if (!um) {
-                UOA_STATS_INC(uoa_miss);
-                goto out;
+            um = uoa_map_ele_new(af, optptr, optlen, iph, sport, dport);
+            if (likely(um != NULL)) {
+                return um;
             }
-
-            atomic_set(&um->refcnt, 0);
-            um->af = af;
-            if (AF_INET == af) {
-                memmove(&um->saddr.in, &((struct iphdr *)iph)->saddr,
-                            sizeof(struct in_addr));
-                memmove(&um->daddr.in, &((struct iphdr *)iph)->daddr,
-                            sizeof(struct in_addr));
-            } else {
-                /* ipv6 */
-                memmove(&um->saddr.in6, &((struct ipv6hdr *)iph)->saddr,
-                            sizeof(struct in6_addr));
-                memmove(&um->daddr.in6, &((struct ipv6hdr *)iph)->daddr,
-                            sizeof(struct in6_addr));
-            }
-            um->sport = sport;
-            um->dport = dport;
-            memcpy(&um->optuoa, optptr, optlen);
-
-            UOA_STATS_INC(uoa_saved);
-            return um;
         }
 
         l -= optlen;
@@ -846,6 +863,70 @@ static struct uoa_map *uoa_opp_rcv(__be16 af, void *iph, struct sk_buff *skb)
     return um;
 }
 
+int inline ipv6_find_dopt_uoa(const struct ipv6hdr *ip6h, struct sk_buff *skb)
+{
+    int dopt_hdr_offset = 0;
+    struct ipv6_destopt_hdr *dopt = NULL;
+
+    if (ipv6_find_hdr(skb, &dopt_hdr_offset, NEXTHDR_DEST, NULL, NULL) != NEXTHDR_DEST) {
+        return -1;
+    }
+
+    /*
+     * Destination Options header may occur at most twice. UOA Option must
+     * occur at DestOpt before the uppper-layer header.
+     */
+    dopt = (struct ipv6_destopt_hdr *) ((uint8_t *) ip6h + dopt_hdr_offset);
+    if (ipv6_ext_hdr(dopt->nexthdr)) {
+        if (ipv6_find_hdr(skb, &dopt_hdr_offset, NEXTHDR_DEST, NULL, NULL) != NEXTHDR_DEST) {
+            return -1;
+        }
+        dopt = (struct ipv6_destopt_hdr *) ((uint8_t *) ip6h + dopt_hdr_offset);
+    }
+
+    if (dopt->nexthdr != IPPROTO_UDP) {
+        return -1;
+    }
+    return ipv6_find_tlv(skb, dopt_hdr_offset, IPOPT_UOA);
+}
+
+static struct uoa_map *uoa_dopt_rcv(const struct ipv6hdr *ip6h, struct sk_buff *skb, int uoa_offset)
+{
+    int ip6h_len = ipv6_hdrlen(skb);
+    struct ipopt_uoa *uoa = NULL;
+    struct udphdr *uh = NULL;
+    struct uoa_map *um = NULL;
+
+    if (unlikely(!pskb_may_pull(skb, ip6h_len + sizeof(struct udphdr)))) {
+        return NULL;
+    }
+ 
+    uoa = (struct ipopt_uoa *) ((uint8_t *) ip6h + uoa_offset);
+    if (unlikely(uoa->op_code != IPOPT_UOA)) {
+        return NULL;
+    }
+
+    uh = (struct udphdr *) ((uint8_t *) ip6h + ip6h_len);
+    
+    /*
+     * Destination Options Header use TLV format options, whose opt_len not includes
+     * length of opt_type and opt_len field length. Convert it to IP Option format
+     * before call uoa_map_ele_new().
+     */
+    uoa->op_len += 2;
+    um = uoa_map_ele_new(AF_INET6, (uint8_t *) uoa, uoa->op_len, (void *) ip6h, 
+                         uh->source, uh->dest);
+    uoa->op_len -= 2;
+
+    if (unlikely(um && uoa_send_ack(skb) != 0)) {
+        UOA_STATS_INC(uoa_ack_fail);
+        pr_warn("fail to send UOA ACK\n");
+    }
+
+    return um;
+}
+
+
 static struct uoa_map *uoa_skb_rcv_opt(struct sk_buff *skb)
 {
     struct iphdr *iph = ip_hdr(skb);
@@ -854,8 +935,9 @@ static struct uoa_map *uoa_skb_rcv_opt(struct sk_buff *skb)
     if (AF_INET6 == af) {
         struct ipv6hdr *ip6h = ipv6_hdr(skb);
         if (ipv6_hdrlen(skb) != sizeof(struct ipv6hdr)) {
-            if (uoa_debug) {
-                pr_info("we not support uoa with ipv6 ext header now.");
+            int uoa_offset = ipv6_find_dopt_uoa(ip6h, skb);
+            if (unlikely(uoa_offset > 0)) {
+                return uoa_dopt_rcv(ip6h, skb, uoa_offset);
             }
         }
         if (unlikely(ip6h->nexthdr == IPPROTO_OPT)) {

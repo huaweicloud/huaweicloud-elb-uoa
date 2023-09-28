@@ -1,0 +1,22 @@
+# IDE
+.idea
+
+# C
+udp_serv
+
+# Python C Extension
+build/
+*.so
+
+# Kmod
+*.ko.cmd
+*.mod.cmd
+*.mod.o.cmd
+*.o.cmd
+*.symvers
+*.order
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.o
